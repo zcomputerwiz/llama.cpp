@@ -309,6 +309,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     uint64_t call_count;
+    bool     peer_ok;      // direct GPU<->GPU copies (NVLink or PCIe P2P) available; skips host staging
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -436,6 +437,28 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
+
+    // Direct peer path: each GPU pushes its contribution straight into the
+    // other's dev_tmp over NVLink / PCIe P2P.  Set GGML_CUDA_AR_P2P=0 to disable.
+    // Only used for reductions past GGML_CUDA_AR_COPY_THRESHOLD; smaller ones keep the
+    // spin-wait kernel, which has lower latency than a peer memcpy (token generation).
+    // Virtual devices share a physical GPU, so peer copies make no sense there.
+    p->peer_ok = ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P", 1) != 0 &&
+                 ggml_cuda_info().device_count == ggml_cuda_info().physical_device_count;
+    for (size_t i = 0; i < n_devices && p->peer_ok; ++i) {
+        int can_access = 0;
+        ggml_cuda_set_device(devices[i]);
+        if (cudaDeviceCanAccessPeer(&can_access, devices[i], devices[1 - i]) != cudaSuccess || !can_access) {
+            p->peer_ok = false;
+            break;
+        }
+        const cudaError_t rc = cudaDeviceEnablePeerAccess(devices[1 - i], 0);
+        if (rc != cudaSuccess && rc != cudaErrorPeerAccessAlreadyEnabled) {
+            p->peer_ok = false;
+        }
+    }
+    (void) cudaGetLastError(); // clear sticky error from a failed probe
+    GGML_LOG_INFO("%s: direct peer copies %s\n", __func__, p->peer_ok ? "enabled" : "unavailable, staging via host memory");
 
     // Per-device streams and event pools.
     for (size_t i = 0; i < n_devices; ++i) {
@@ -589,6 +612,72 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+// Peer variant of copy_impl: GPU i pushes src_buf[i] directly into dev_tmp[peer]
+// with one cudaMemcpyPeerAsync (no host staging), then each GPU adds dev_tmp
+// into dst_buf on its compute stream.  dev_tmp is cudaMalloc'd, so it needs only
+// cudaDeviceEnablePeerAccess (done at init), unlike VMM tensor memory.
+template <typename T_src, typename T_dst>
+static bool ggml_cuda_ar_allreduce_peer_impl(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
+        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
+        const bool              compute[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne,
+        size_t                  nbytes) {
+    GGML_ASSERT(p->n_devices == 2);
+    GGML_ASSERT(nbytes <= p->copy_bytes);
+    GGML_ASSERT(ne <= std::numeric_limits<int>::max());
+
+    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+    ggml_backend_cuda_context * cuda_ctx[2] = {};
+
+    // Stage 1: push local contribution into the peer's dev_tmp.
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
+
+        ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
+
+        // Peer's previous add_kernel must be done reading its dev_tmp.
+        if (p->dev_tmp_kernel_done_valid) {
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[peer]));
+        }
+        if (!compute[i]) {
+            CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i]));
+        }
+        CUDA_CHECK(cudaMemcpyPeerAsync(p->dev_tmp[peer], p->devices[peer], src_buf[i], p->devices[i],
+                                       nbytes, p->streams[i]));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, p->streams[i]));
+    }
+
+    // Stage 2: once the peer's push landed, add it on the compute stream.
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[peer][slot].h2d));
+        // dst may alias src: our own push must finish reading it before we overwrite.
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
+
+        const int block_size = 256;
+        int n_blocks = (int) ((ne + block_size - 1) / block_size);
+        if (n_blocks > 1024) {
+            n_blocks = 1024;
+        }
+        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
+            dst_buf[i], reinterpret_cast<const T_src *>(p->dev_tmp[i]), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+    }
+    p->dev_tmp_kernel_done_valid = true;
+
+    return true;
+}
+
 // Asymmetric copy_impl: data sent over PCIe in T_src precision (one element of
 // nbytes per ne element); accumulated locally into a T_dst buffer.  When
 // T_src == T_dst this is the original homogeneous reduction.  When they differ
@@ -739,8 +828,9 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
             src[i] = src_buf[i] + outer_start;
             dst[i] = dst_buf[i] + outer_start;
         }
-        ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
-            p, backends, src, dst, compute, outer_ne, outer_nbytes);
+        ok = p->peer_ok
+            ? ggml_cuda_ar_allreduce_peer_impl<T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes)
+            : ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes);
     }
     return ok;
 }
