@@ -1,0 +1,183 @@
+name: Build (CUDA, Windows, Standalone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: 'CUDA Toolkit version'
+        required: true
+        default: '13.5'
+        type: choice
+        options:
+          - '13.5'
+          - '12.4'
+      cuda_architectures:
+        description: 'CMAKE_CUDA_ARCHITECTURES target (86-real = RTX 3090/Ampere). Leave empty for broad default set.'
+        required: false
+        default: '86-real'
+        type: string
+      cuda_fa_quants:
+        description: 'FlashAttention K-V quant combinations ("all" or semicolon-separated pairs like "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f8_e4m3-f8_e4m3")'
+        required: false
+        default: 'all'
+        type: string
+      bundle_cudart:
+        description: 'Bundle CUDA runtime DLLs (cudart, cublas, cublasLt) into the output zip'
+        required: false
+        default: true
+        type: boolean
+
+cache-mode: write
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: build-windows-cuda-standalone-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build-windows-cuda:
+    name: windows-cuda-standalone (${{ inputs.cuda_version }}, x64)
+    runs-on: windows-2022
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: standalone-windows-2022-x64-cuda-${{ inputs.cuda_version }}
+          max-size: "2G"
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ inputs.cuda_version }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        id: install_ninja
+        run: |
+          choco install ninja
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        env:
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+          CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures }}
+          CUDA_FA_QUANTS: ${{ inputs.cuda_fa_quants }}
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          set EXTRA_CMAKE_ARGS=
+          rem CTK >= 13.5 bundles CCCL >= 3.5; fetch CCCL for older toolkits
+          if not "%CUDA_VERSION%"=="13.5" (
+            set EXTRA_CMAKE_ARGS=%EXTRA_CMAKE_ARGS% -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          )
+          if not "%CUDA_ARCHITECTURES%"=="" (
+            set EXTRA_CMAKE_ARGS=%EXTRA_CMAKE_ARGS% "-DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCHITECTURES%"
+          )
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CPU_REPACK=ON ^
+            -DGGML_LLAMAFILE=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_RPC=ON ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA=ON ^
+            "-DGGML_CUDA_FA_QUANTS=%CUDA_FA_QUANTS%" ^
+            -DGGML_CUDA_GRAPHS=ON ^
+            -DGGML_CUDA_COMPRESSION_MODE=size ^
+            -DGGML_CUDA_NO_VMM=OFF ^
+            -DGGML_CUDA_NO_PEER_COPY=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            %EXTRA_CMAKE_ARGS% || exit /b 1
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% || exit /b 1
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outDir = ".\build\bin\Release"
+          $required = @("ggml-cuda.dll", "llama-server.exe", "llama-cli.exe")
+          foreach ($file in $required) {
+            $path = Join-Path $outDir $file
+            if (-not (Test-Path $path)) {
+              Write-Host "##[error]Expected build output not found: $path"
+              Get-ChildItem $outDir | Format-Table Name, Length -AutoSize
+              exit 1
+            }
+          }
+          Get-ChildItem $outDir | Format-Table Name, Length -AutoSize
+
+      - name: Bundle CUDA runtime DLLs
+        if: ${{ inputs.bundle_cudart }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outDir = ".\build\bin\Release"
+          $searchDirs = @(
+            (Join-Path $env:CUDA_PATH "bin"),
+            (Join-Path $env:CUDA_PATH "lib"),
+            (Join-Path $env:CUDA_PATH "bin\x64")
+          ) | Where-Object { Test-Path $_ }
+          $patterns = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")
+          foreach ($pattern in $patterns) {
+            $found = $false
+            foreach ($dir in $searchDirs) {
+              $files = Get-ChildItem -Path $dir -Filter $pattern -File -ErrorAction SilentlyContinue
+              foreach ($f in $files) {
+                Copy-Item -Path $f.FullName -Destination $outDir -Force
+                Write-Host "Bundled $($f.Name) from $dir"
+                $found = $true
+              }
+            }
+            if (-not $found) {
+              Write-Host "##[error]CUDA runtime DLL not found for pattern: $pattern"
+              exit 1
+            }
+          }
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        shell: pwsh
+        env:
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Copy-Item -Path .\LICENSE -Destination .\build\bin\Release\ -Force
+          $zipName = "llama-bin-win-cuda-$($env:CUDA_VERSION)-x64-standalone.zip"
+          7z a -snl $zipName .\build\bin\Release\*
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          archive: false
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: standalone-windows-2022-x64-cuda-${{ inputs.cuda_version }}
