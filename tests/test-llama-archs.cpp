@@ -327,9 +327,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     } else if (arch == LLM_ARCH_HRM_TEXT) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
     } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
-        n_embd  = 128;
+        // head size 64 so GPU flash attention supports -sm tensor
+        n_embd  = 256;
         n_head  = 4;
-        n_ff    = 24;
+        n_ff    = 256;
         n_layer = 3;
     }
 

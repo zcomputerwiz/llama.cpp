@@ -2292,7 +2292,13 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cb(cur, "ffn_reglu", il);
             } break;
         case LLM_FFN_SITU:
-            GGML_ABORT("not yet supported");
+            if (gate && type_gate == LLM_FFN_PAR) {
+                cur = ggml_situ(ctx0, cur, tmp, hparams.situ_beta, hparams.situ_linear_beta);
+                cb(cur, "ffn_situ", il);
+                type_gate = LLM_FFN_SEQ;
+            } else {
+                GGML_ABORT("not yet supported");
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -2637,15 +2643,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 {
                     // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
                     GGML_ASSERT(has_gate);
-                    const float beta = hparams.situ_beta;
-                    const float lb   = hparams.situ_linear_beta;
-
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                    }
-                    cur = ggml_mul(ctx0, act, up);
+                    cur = ggml_situ(ctx0, cur, up, hparams.situ_beta, hparams.situ_linear_beta);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:

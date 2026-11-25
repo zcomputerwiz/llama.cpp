@@ -1076,6 +1076,9 @@ struct llama_model {
     // graph size budget: max graph nodes per model tensor
     virtual uint32_t graph_nodes_per_tensor() const { return 8; }
 
+    // physical layer of cache slot il
+    virtual int layer_phys(int il) const { return il; }
+
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
 

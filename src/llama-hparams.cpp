@@ -205,15 +205,15 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
     return val;
 }
 
-uint32_t llama_hparams::n_embd_r() const {
+uint32_t llama_hparams::n_embd_r(uint32_t il) const {
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
     }
 
     if (n_sconv_channels != 0) {
-        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too
-        return n_sconv_channels * (n_shortconv_l_cache - 1);
+        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too: K conv history
+        return n_embd_k_gqa(il) * (n_shortconv_l_cache - 1);
     }
 
     if (n_shortconv_l_cache != 0) {
@@ -243,10 +243,15 @@ uint32_t llama_hparams::n_embd_r() const {
     return n_conv;
 }
 
-uint32_t llama_hparams::n_embd_s() const {
+uint32_t llama_hparams::n_embd_s(uint32_t il) const {
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
         return n_embd * wkv_head_size;
+    }
+
+    if (n_sconv_channels != 0) {
+        // for Inkling2 models: V conv history
+        return n_embd_v_gqa(il) * (n_shortconv_l_cache - 1);
     }
 
     if (n_cca_qk != 0) {
@@ -281,6 +286,11 @@ bool llama_hparams::is_recr(uint32_t il) const {
 }
 
 uint32_t llama_hparams::ple_conv_state() const {
+    if (n_sconv_channels != 0) {
+        // Inkling2 post-attn and post-FFN conv histories stay mirrored while K/V conv states split by head
+        return n_sconv_channels * (n_shortconv_l_cache - 1);
+    }
+
     if (ple_n_heads == 0 || ple_conv_kernel == 0) {
         return 0;
     }

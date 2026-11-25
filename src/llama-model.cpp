@@ -458,6 +458,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_kv_b_weight("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    static const std::regex pattern_attn_q_clip     ("blk\\.\\d*\\.attn_q_clip\\.weight");
+    static const std::regex pattern_attn_rel        ("blk\\.\\d*\\.attn_rel\\.weight");
+    static const std::regex pattern_attn_rel_clip   ("blk\\.\\d*\\.attn_rel_clip\\.weight");
+    static const std::regex pattern_attn_sink_proj  ("blk\\.\\d*\\.attn_sink_proj\\.weight");
+    static const std::regex pattern_attn_kv_conv    ("blk\\.\\d*\\.attn_(k|v)_conv\\.weight");
+    static const std::regex pattern_attn_kv_conv_prj("blk\\.\\d*\\.attn_(k|v)_conv_proj\\.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -528,7 +534,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
-            il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            il = ud->model->layer_phys(std::stoull(tensor_name.substr(layer_index_start + 2)));
             prefix = "blk." + std::to_string(il) + ".";
             rotation = get_il_eff(il) % ud->n_devices;
         } else {
@@ -640,6 +646,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
+        if (std::regex_match(tensor_name, pattern_attn_q_clip) ||
+                std::regex_match(tensor_name, pattern_attn_rel) ||
+                std::regex_match(tensor_name, pattern_attn_rel_clip) ||
+                std::regex_match(tensor_name, pattern_attn_sink_proj) ||
+                std::regex_match(tensor_name, pattern_attn_kv_conv) ||
+                std::regex_match(tensor_name, pattern_attn_kv_conv_prj)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
@@ -654,7 +668,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // the LFM2 shortconv block runs fully mirrored, so its conv state must be mirrored too
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
             }
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight", "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
@@ -685,7 +699,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            if (is_dsv4 || hparams.n_vocab_unpadded > 0) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
@@ -933,6 +947,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
                 return {granularity_head};
             }
+            if (std::regex_match(tensor_name, pattern_attn_q_clip) ||
+                    std::regex_match(tensor_name, pattern_attn_rel_clip) ||
+                    std::regex_match(tensor_name, pattern_attn_sink_proj)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_head};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_rel)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_head * hparams.n_relative};
+            }
 
             if (is_dsv4) {
                 if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
@@ -982,10 +1006,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_v_exps_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
-                std::regex_match(tensor_name, pattern_kv_cache)) {
+                std::regex_match(tensor_name, pattern_kv_cache) ||
+                std::regex_match(tensor_name, pattern_attn_kv_conv)) {
                 GGML_ASSERT(segments.size() == 1);
                 const bool is_v = tensor_name.find("attn_v") != std::string::npos || tensor_name.find("cache_v") != std::string::npos;
                 return {is_v ? granularity_v : granularity_kv};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_kv_conv_prj)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {(granularity_kv / hparams.n_embd_head_k(il)) * hparams.n_shortconv_l_cache};
+            }
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_kv * (hparams.n_shortconv_l_cache - 1)};
+            }
+            if (std::regex_match(tensor_name, pattern_s_cache)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_v * (hparams.n_shortconv_l_cache - 1)};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 // fused full attention layers need Q gate tensors handled like above:

@@ -534,10 +534,10 @@ struct llama_hparams {
 
     // dimension of the rolling state embeddings
     // corresponds to Mamba's conv_states size or RWKV's token_shift states size
-    uint32_t n_embd_r() const;
+    uint32_t n_embd_r(uint32_t il = 0) const;
 
     // dimension of the recurrent state embeddings
-    uint32_t n_embd_s() const;
+    uint32_t n_embd_s(uint32_t il = 0) const;
 
     uint32_t n_pos_per_embd() const;
 

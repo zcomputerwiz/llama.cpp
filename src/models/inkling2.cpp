@@ -59,8 +59,8 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     // no RoPE, the relative-position bias carries the positions
     hparams.rope_pattern.fill(false);
 
-    // the convolution state keeps K, V, the attention output and the FFN output of the widest layer
-    uint64_t n_channels_max = 0;
+    // K and V conv histories live in r and s (split by KV head), post-attn and post-FFN conv histories in p (mirrored)
+    uint64_t n_channels_max = 2ull * hparams.n_embd;
 
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (!hparams.n_head_kv(il) || hparams.n_head(il) % hparams.n_head_kv(il) ||
@@ -69,14 +69,15 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error("inkling2: invalid attention or expert dimensions");
         }
 
-        n_channels_max = std::max<uint64_t>(n_channels_max, 2ull * hparams.n_embd_k_gqa(il) + 2ull * hparams.n_embd);
+        n_channels_max = std::max<uint64_t>(n_channels_max, hparams.n_embd_k_gqa(il));
+        hparams.is_ple_impl[il] = true;
     }
 
     if (n_channels_max * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
         throw std::runtime_error("inkling2: convolution state is too large");
     }
 
-    hparams.n_sconv_channels = n_channels_max;
+    hparams.n_sconv_channels = 2 * hparams.n_embd;
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -284,9 +285,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, messages, 1, n_embd, n_tokens, messages->nb[1], messages->nb[2], ctrl*messages->nb[0])), n_embd, n_tokens);
     };
 
-    ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
-    history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    const int64_t n_win = hparams.n_shortconv_l_cache - 1;
+
+    ggml_tensor * k_state = recr->mctx->get_r_l(il);
+    ggml_tensor * v_state = recr->mctx->get_s_l(il);
+    ggml_tensor * p_state = recr->mctx->get_p_l(il);
+
+    ggml_tensor * k_hist = ggml_reshape_3d(ctx0, build_rs(recr, k_state, hparams.n_embd_r(il),     ubatch.n_seqs), n_win, n_embd_k_gqa,             ubatch.n_seqs);
+    ggml_tensor * v_hist = ggml_reshape_3d(ctx0, build_rs(recr, v_state, hparams.n_embd_s(il),     ubatch.n_seqs), n_win, n_embd_k_gqa,             ubatch.n_seqs);
+    ggml_tensor * p_hist = ggml_reshape_3d(ctx0, build_rs(recr, p_state, hparams.ple_conv_state(), ubatch.n_seqs), n_win, hparams.n_sconv_channels, ubatch.n_seqs);
 
     ggml_tensor * inpSA = cur;
 
@@ -323,9 +330,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     {
         ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
         ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), k_state, k_hist, recr, 0);
         ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), v_state, v_hist, recr, 0);
         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
 
         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
@@ -362,14 +369,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
         cb(kq_b, "kq_b", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        // base the zero sink shape on the head-split projection so Meta splits it on axis 0
+        sinks = ggml_fill(ctx0, ggml_view_1d(ctx0, sinks, n_head, 0), 0.0f);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
-        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, p_state, p_hist, recr, 0);
         cb(cur, "attn_out", il);
     }
 
@@ -405,7 +413,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             nullptr,
             layer.ffn_gate_up_exps);
 
-    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
+    cur = convolve(cur, layer.ffn_post_conv, nullptr, p_state, p_hist, recr, n_embd);
     cb(cur, "ffn_out", il);
 
     cur = ggml_add(ctx0, ffn_inp, cur);
