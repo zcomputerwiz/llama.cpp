@@ -309,7 +309,10 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     uint64_t call_count;
+    uint64_t sync_interval;  // 0 = async (no host sync), 1 = sync every AR, N > 1 = sync every N ARs
+    bool     flush_streams;  // call non-blocking cudaStreamQuery after chunked AR launch
     bool     peer_ok;      // direct GPU<->GPU copies (NVLink or PCIe P2P) available; skips host staging
+    bool     slot_ker_valid[GGML_CUDA_AR_POOL_SIZE];
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -319,6 +322,8 @@ struct ggml_cuda_ar_pipeline {
     int  *                    peer_arrival[GGML_CUDA_MAX_DEVICES]; // peer-accessible device arrival ring
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
     ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
+    cudaEvent_t              periodic_sync[GGML_CUDA_MAX_DEVICES];
+    bool                     periodic_sync_valid;
 
     // Copy-engine: per-device "I finished reading my peer's host_large"
     // event.  Indexed by RECORDER device.  Recorded same-device on streams[i]
@@ -365,8 +370,9 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
 }
 
 struct ggml_cuda_ar_slot_info {
-    int slot;
-    int token;
+    int      slot;
+    int      token;
+    uint64_t call_id;
 };
 
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
@@ -374,14 +380,41 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * 
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
 
-    if (pool_lapped) {
+    if (p->sync_interval == 1) {
+        if (pool_lapped && p->slot_ker_valid[slot]) {
+            for (int i = 0; i < p->n_devices; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+            }
+            p->slot_ker_valid[slot] = false;
+        }
+    } else if (p->sync_interval > 1 && (p->call_count % p->sync_interval) == 0 && p->periodic_sync_valid) {
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+            CUDA_CHECK(cudaEventSynchronize(p->periodic_sync[i]));
         }
     }
 
-    return { slot, (int) p->call_count };
+    return { slot, (int) p->call_count, p->call_count };
+}
+
+static void ggml_cuda_ar_record_done(
+        ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, int slot, uint64_t call_id) {
+    if (p->sync_interval == 1) {
+        for (int i = 0; i < p->n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx->stream()));
+        }
+        p->slot_ker_valid[slot] = true;
+    } else if (p->sync_interval > 1 && (call_id % p->sync_interval) == 0) {
+        for (int i = 0; i < p->n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            CUDA_CHECK(cudaEventRecord(p->periodic_sync[i], cuda_ctx->stream()));
+        }
+        p->periodic_sync_valid = true;
+    }
 }
 
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
@@ -441,6 +474,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    p->sync_interval    = ggml_cuda_ar_env_u64("GGML_CUDA_AR_SYNC_INTERVAL", 0);
+    p->flush_streams    = ggml_cuda_ar_env_u64("GGML_CUDA_AR_FLUSH", 0) != 0;
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -504,6 +539,12 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
         if (cudaEventCreateWithFlags(&p->dev_tmp_kernel_done[i], cudaEventDisableTiming) != cudaSuccess) {
             GGML_LOG_ERROR("%s: cudaEventCreate for dev_tmp_kernel_done failed for device %d\n",
+                           __func__, p->devices[i]);
+            ggml_cuda_ar_pipeline_free(p);
+            return nullptr;
+        }
+        if (cudaEventCreateWithFlags(&p->periodic_sync[i], cudaEventDisableTiming) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaEventCreate for periodic_sync failed for device %d\n",
                            __func__, p->devices[i]);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
@@ -593,8 +634,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU, sync_interval=%llu, flush=%d\n",
+                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20,
+                  (unsigned long long) p->sync_interval, p->flush_streams ? 1 : 0);
 
     return p;
 }
@@ -644,6 +686,10 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaEventDestroy(p->dev_tmp_kernel_done[i]));
         }
+        if (p->periodic_sync[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaEventDestroy(p->periodic_sync[i]));
+        }
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaStreamDestroy(p->streams[i]));
@@ -674,7 +720,8 @@ static bool ggml_cuda_ar_allreduce_peer_impl(
     GGML_ASSERT(nbytes <= p->copy_bytes);
     GGML_ASSERT(ne <= std::numeric_limits<int>::max());
 
-    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+    const auto slot_info = ggml_cuda_ar_acquire_slot(p);
+    const int  slot      = slot_info.slot;
     ggml_backend_cuda_context * cuda_ctx[2] = {};
 
     // Stage 1: push local contribution into the peer's dev_tmp.
@@ -716,8 +763,8 @@ static bool ggml_cuda_ar_allreduce_peer_impl(
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
-        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
     }
+    ggml_cuda_ar_record_done(p, backends, slot, slot_info.call_id);
     p->dev_tmp_kernel_done_valid = true;
 
     return true;
@@ -745,7 +792,8 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
     GGML_ASSERT(chunk_bytes > 0);
 
-    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+    const auto slot_info = ggml_cuda_ar_acquire_slot(p);
+    const int  slot      = slot_info.slot;
     const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
     GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
 
@@ -834,11 +882,10 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         CUDA_CHECK(cudaGetLastError());
 
         // Record dev_tmp-released on the compute stream so the next copy_impl
-        // can wait for the kernel to finish before overwriting dev_tmp.  Also
-        // record AR-done as ev.ker for acquire_slot's pool-wraparound sync.
+        // can wait for the kernel to finish before overwriting dev_tmp.
         CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
-        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
     }
+    ggml_cuda_ar_record_done(p, backends, slot, slot_info.call_id);
     p->host_large_read_done_valid = true;
     p->dev_tmp_kernel_done_valid = true;
 
@@ -1033,12 +1080,15 @@ bool ggml_cuda_ar_allreduce(
         // small-tensor (tg) latency on the AR-stream variant.  Only ev.ker is
         // still recorded at end-of-AR for acquire_slot's pool-wraparound check.
         for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
-            const size_t remaining_elems = (size_t) (ne - chunk_start);
-            const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
+            const size_t remaining_elems  = (size_t) (ne - chunk_start);
+            const size_t chunk_elems      = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
+            const size_t chunk_wire_bytes = chunk_elems * type_size;
+            const int    n_blocks         = std::max(1, std::min(GGML_CUDA_AR_KERNEL_BLOCKS, (int) ((chunk_wire_bytes + 8191) / 8192)));
 
-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
-            const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+            const auto slot_info = ggml_cuda_ar_acquire_slot(p);
+            const int  slot      = slot_info.slot;
+            const int  token     = slot_info.token;
 
             for (int i = 0; i < n; ++i) {
                 const int peer = 1 - i;  // valid for n == 2 only
@@ -1057,7 +1107,7 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(n_blocks), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
                     reinterpret_cast<T_wire *>(p->peer_ok \
@@ -1085,9 +1135,18 @@ bool ggml_cuda_ar_allreduce(
 
 #undef LAUNCH_AR_KERNEL
                 CUDA_CHECK(cudaGetLastError());
+            }
 
-                if (last_chunk) {
-                    CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+            ggml_cuda_ar_record_done(p, backends, slot, slot_info.call_id);
+
+            if (p->flush_streams) {
+                for (int i = 0; i < n; ++i) {
+                    ggml_cuda_set_device(p->devices[i]);
+                    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                    const cudaError_t qrc = cudaStreamQuery(cuda_ctx->stream());
+                    if (qrc != cudaSuccess && qrc != cudaErrorNotReady) {
+                        CUDA_CHECK(qrc);
+                    }
                 }
             }
         }
