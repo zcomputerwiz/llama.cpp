@@ -2543,8 +2543,15 @@ struct llama_model_inkling2 : public llama_model_base {
     };
 
     struct graph : public llm_graph_context {
+        struct block_stack {
+            std::vector<ggml_tensor *> norms;
+            ggml_tensor * cat = nullptr;
+        };
+
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        void push_block(block_stack & blocks, ggml_tensor * block);
+        ggml_tensor * mix_states(ggml_tensor * states, ggml_tensor * states_t, ggml_tensor * query);
+        ggml_tensor * mix(const block_stack & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2554,7 +2561,7 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl, ggml_tensor * cur_norm = nullptr);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2563,10 +2570,10 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
-        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, block_stack & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        void build_output(ggml_tensor * cur, const block_stack & blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
@@ -2574,6 +2581,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        std::vector<ggml_tensor *> padded_rel_bias;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

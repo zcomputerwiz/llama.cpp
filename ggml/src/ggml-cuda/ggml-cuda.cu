@@ -4518,6 +4518,295 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_match_rel_pos_mask(
+        const ggml_cgraph * cgraph,
+        int                 i,
+        const ggml_tensor * & table,
+        const ggml_tensor * & sinks,
+        const ggml_tensor * & rel_pos,
+        const ggml_tensor * & base_mask,
+        ggml_tensor *       & dst,
+        int                 & n_ops) {
+    static const ggml_op ops_f16[9] = {
+        GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+        GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY
+    };
+    const bool has_cpy = i + 8 < cgraph->n_nodes && cgraph->nodes[i + 8]->op == GGML_OP_CPY;
+    const int  cand_n  = has_cpy ? 9 : 8;
+    if (i + cand_n - 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const int out_idx = i + cand_n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, cand_n, ops_f16, &out_idx, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * sub      = cgraph->nodes[i + 0];
+    const ggml_tensor * perm0    = cgraph->nodes[i + 1];
+    const ggml_tensor * cont0    = cgraph->nodes[i + 2];
+    const ggml_tensor * get_rows = cgraph->nodes[i + 3];
+    const ggml_tensor * resh     = cgraph->nodes[i + 4];
+    const ggml_tensor * perm1    = cgraph->nodes[i + 5];
+    const ggml_tensor * cont1    = cgraph->nodes[i + 6];
+    ggml_tensor       * add      = cgraph->nodes[i + 7];
+    dst                          = cgraph->nodes[out_idx];
+
+    table = sub->src[0];
+    sinks = sub->src[1];
+    if (!table || !sinks || table->type != GGML_TYPE_F32 || sinks->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(table) || !ggml_is_contiguous(sinks) ||
+            table->ne[3] != 1 || sinks->ne[0] != 1 || sinks->ne[1] != table->ne[1] ||
+            sinks->ne[2] != table->ne[2] || sinks->ne[3] != 1) {
+        return false;
+    }
+
+    if (perm0->src[0] != sub ||
+            perm0->op_params[0] != 1 || perm0->op_params[1] != 0 ||
+            perm0->op_params[2] != 2 || perm0->op_params[3] != 3) {
+        return false;
+    }
+    if (cont0->src[0] != perm0 || get_rows->src[0] != cont0) {
+        return false;
+    }
+
+    rel_pos = get_rows->src[1];
+    if (!rel_pos || rel_pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(rel_pos) ||
+            rel_pos->ne[1] != table->ne[2] || rel_pos->ne[2] != 1 || rel_pos->ne[3] != 1) {
+        return false;
+    }
+
+    const int64_t n_head       = table->ne[1];
+    const int64_t n_tokens     = table->ne[2];
+    const int64_t n_kv         = rel_pos->ne[0];
+    const int64_t n_stream     = resh->ne[3];
+    const int64_t n_seq_tokens = resh->ne[2];
+    if (resh->src[0] != get_rows || resh->ne[0] != n_head || resh->ne[1] != n_kv ||
+            n_stream <= 0 || n_seq_tokens <= 0 || n_seq_tokens * n_stream != n_tokens) {
+        return false;
+    }
+    if (perm1->src[0] != resh ||
+            perm1->op_params[0] != 2 || perm1->op_params[1] != 0 ||
+            perm1->op_params[2] != 1 || perm1->op_params[3] != 3) {
+        return false;
+    }
+    if (cont1->src[0] != perm1) {
+        return false;
+    }
+
+    base_mask = add->src[0] == cont1 ? add->src[1] : (add->src[1] == cont1 ? add->src[0] : nullptr);
+    if (!base_mask || base_mask->type != GGML_TYPE_F32 || !ggml_is_contiguous(base_mask) ||
+            base_mask->ne[0] != n_kv || base_mask->ne[1] != n_seq_tokens ||
+            base_mask->ne[2] != 1 || base_mask->ne[3] != n_stream) {
+        return false;
+    }
+    if (has_cpy && dst->src[0] != add) {
+        return false;
+    }
+
+    const ggml_type expect_type = has_cpy ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    if (dst->type != expect_type || !ggml_is_contiguous(dst) ||
+            dst->ne[0] != n_kv || dst->ne[1] != n_seq_tokens ||
+            dst->ne[2] != n_head || dst->ne[3] != n_stream) {
+        return false;
+    }
+    if (n_tokens > UINT16_MAX || n_head > UINT16_MAX) {
+        return false;
+    }
+
+    n_ops = cand_n;
+    return true;
+}
+
+static bool ggml_cuda_match_l2_norm_clip(
+        const ggml_cgraph * cgraph,
+        int                 i,
+        const ggml_tensor * & src,
+        const ggml_tensor * & mul_w,
+        ggml_tensor *       & dst,
+        float               & eps,
+        float               & post_scale,
+        int                 & n_ops) {
+    static const ggml_op ops_3[3] = { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
+    static const ggml_op ops_2[2] = { GGML_OP_L2_NORM, GGML_OP_SCALE };
+
+    const bool with_mul = cgraph->nodes[i]->op == GGML_OP_MUL;
+    const int  cand_n   = with_mul ? 3 : 2;
+    if (i + cand_n - 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const int out_idx = i + cand_n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, cand_n, with_mul ? ops_3 : ops_2, &out_idx, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * l2_node = cgraph->nodes[with_mul ? i + 1 : i];
+    dst                         = cgraph->nodes[out_idx];
+    if (dst->src[0] != l2_node || dst->type != GGML_TYPE_F32 || l2_node->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(dst) || ggml_get_op_params_f32(dst, 1) != 0.0f) {
+        return false;
+    }
+
+    if (with_mul) {
+        const ggml_tensor * mul_node = cgraph->nodes[i];
+        if (l2_node->src[0] != mul_node || mul_node->type != GGML_TYPE_F32) {
+            return false;
+        }
+        src   = mul_node->src[0];
+        mul_w = mul_node->src[1];
+        if (!ggml_are_same_shape(src, mul_node)) {
+            std::swap(src, mul_w);
+        }
+        if (!src || !mul_w || !ggml_are_same_shape(src, mul_node) ||
+                src->type != GGML_TYPE_F32 || mul_w->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src) || !ggml_is_contiguous(mul_w) ||
+                mul_w->ne[0] != src->ne[0] || (mul_w->ne[1] != src->ne[1] && mul_w->ne[1] != 1) ||
+                mul_w->ne[2] != 1 || mul_w->ne[3] != 1) {
+            return false;
+        }
+    } else {
+        src   = l2_node->src[0];
+        mul_w = nullptr;
+        if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src)) {
+            return false;
+        }
+    }
+
+    if (src->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    memcpy(&eps, l2_node->op_params, sizeof(float));
+    post_scale = ggml_get_op_params_f32(dst, 0);
+    if (eps < 0.0f) {
+        return false;
+    }
+
+    n_ops = cand_n;
+    return true;
+}
+
+static bool ggml_cuda_match_loop_ctrl(
+        const ggml_cgraph * cgraph,
+        int                 i,
+        const ggml_tensor * & cur,
+        const ggml_tensor * & message,
+        const ggml_tensor * & gain_raw,
+        const ggml_tensor * & forget_raw,
+        ggml_tensor *       & dst) {
+    static const ggml_op ops[6] = {
+        GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD
+    };
+    if (i + 5 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const int out_idx = i + 5;
+    if (!ggml_can_fuse_subgraph(cgraph, i, 6, ops, &out_idx, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * tanh_gain   = cgraph->nodes[i + 0];
+    const ggml_tensor * tanh_forget = cgraph->nodes[i + 1];
+    const ggml_tensor * mul_fc      = cgraph->nodes[i + 2];
+    const ggml_tensor * sub         = cgraph->nodes[i + 3];
+    const ggml_tensor * mul_gm      = cgraph->nodes[i + 4];
+    dst                             = cgraph->nodes[i + 5];
+
+    if (ggml_get_unary_op(tanh_gain) != GGML_UNARY_OP_TANH ||
+            ggml_get_unary_op(tanh_forget) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+
+    gain_raw   = tanh_gain->src[0];
+    forget_raw = tanh_forget->src[0];
+    cur        = sub->src[0];
+    if (sub->src[1] != mul_fc) {
+        return false;
+    }
+    if (!((mul_fc->src[0] == tanh_forget && mul_fc->src[1] == cur) ||
+          (mul_fc->src[1] == tanh_forget && mul_fc->src[0] == cur))) {
+        return false;
+    }
+
+    message = mul_gm->src[0] == tanh_gain ? mul_gm->src[1] : (mul_gm->src[1] == tanh_gain ? mul_gm->src[0] : nullptr);
+    if (!((dst->src[0] == sub && dst->src[1] == mul_gm) ||
+          (dst->src[1] == sub && dst->src[0] == mul_gm))) {
+        return false;
+    }
+
+    if (!cur || !message || !gain_raw || !forget_raw ||
+            cur->type != GGML_TYPE_F32 || message->type != GGML_TYPE_F32 ||
+            gain_raw->type != GGML_TYPE_F32 || forget_raw->type != GGML_TYPE_F32 ||
+            dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(cur) || !ggml_is_contiguous(message) ||
+            !ggml_is_contiguous(gain_raw) || !ggml_is_contiguous(forget_raw) ||
+            !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(cur, dst) || !ggml_are_same_shape(message, dst) ||
+            !ggml_are_same_shape(gain_raw, dst) || !ggml_are_same_shape(forget_raw, dst)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_match_ssm_conv_res_scale(
+        const ggml_cgraph * cgraph,
+        int                 i,
+        ggml_tensor *       & ssm_conv,
+        const ggml_tensor * & res,
+        ggml_tensor *       & dst,
+        float               & scale) {
+    static const ggml_op ops[4] = {
+        GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+    };
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const int out_idx = i + 3;
+    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, &out_idx, 1)) {
+        return false;
+    }
+
+    ssm_conv                = cgraph->nodes[i + 0];
+    const ggml_tensor * rsh = cgraph->nodes[i + 1];
+    const ggml_tensor * add = cgraph->nodes[i + 2];
+    dst                     = cgraph->nodes[i + 3];
+
+    if (rsh->src[0] != ssm_conv || dst->src[0] != add || ggml_get_op_params_f32(dst, 1) != 0.0f) {
+        return false;
+    }
+    res = add->src[0] == rsh ? add->src[1] : (add->src[1] == rsh ? add->src[0] : nullptr);
+    if (!res || !ggml_are_same_shape(rsh, res) || !ggml_are_same_shape(res, dst)) {
+        return false;
+    }
+    if (ssm_conv->src[0]->type != GGML_TYPE_F32 || ssm_conv->src[1]->type != GGML_TYPE_F32 ||
+            res->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(res) || !ggml_is_contiguous(dst) ||
+            ssm_conv->src[0]->nb[0] != sizeof(float) || ssm_conv->src[1]->nb[0] != sizeof(float) ||
+            ssm_conv->src[0]->nb[1] != ssm_conv->src[0]->ne[0] * sizeof(float) ||
+            ssm_conv->src[0]->ne[1] % 128 != 0) {
+        return false;
+    }
+    const int64_t nc = ssm_conv->src[1]->ne[0];
+    if (nc != 2 && nc != 3 && nc != 4 && nc != 5 && nc != 7 && nc != 9 && nc != 15) {
+        return false;
+    }
+
+    scale = ggml_get_op_params_f32(dst, 0);
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5360,6 +5649,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    {
+        const ggml_tensor * table     = nullptr;
+        const ggml_tensor * sinks     = nullptr;
+        const ggml_tensor * rel_pos   = nullptr;
+        const ggml_tensor * base_mask = nullptr;
+        ggml_tensor *       dst       = nullptr;
+        int                 n_ops     = 0;
+        if (ggml_cuda_match_rel_pos_mask(cgraph, i, table, sinks, rel_pos, base_mask, dst, n_ops)) {
+            const int out_idx = i + n_ops - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out_idx, 1)) {
+                ggml_cuda_op_rel_pos_mask_fused(*cuda_ctx, table, sinks, rel_pos, base_mask, dst);
+                return n_ops - 1;
+            }
+        }
+    }
+
+    {
+        const ggml_tensor * src        = nullptr;
+        const ggml_tensor * mul_w      = nullptr;
+        ggml_tensor *       dst        = nullptr;
+        float               eps        = 0.0f;
+        float               post_scale = 0.0f;
+        int                 n_ops      = 0;
+        if (ggml_cuda_match_l2_norm_clip(cgraph, i, src, mul_w, dst, eps, post_scale, n_ops)) {
+            const int out_idx = i + n_ops - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out_idx, 1)) {
+                ggml_cuda_op_l2_norm_fused(*cuda_ctx, src, mul_w, dst, eps, post_scale);
+                return n_ops - 1;
+            }
+        }
+    }
+
+    {
+        const ggml_tensor * cur        = nullptr;
+        const ggml_tensor * message    = nullptr;
+        const ggml_tensor * gain_raw   = nullptr;
+        const ggml_tensor * forget_raw = nullptr;
+        ggml_tensor *       dst        = nullptr;
+        if (ggml_cuda_match_loop_ctrl(cgraph, i, cur, message, gain_raw, forget_raw, dst)) {
+            const int out_idx = i + 5;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, &out_idx, 1)) {
+                ggml_cuda_op_loop_ctrl_fused(*cuda_ctx, cur, message, gain_raw, forget_raw, dst);
+                return 5;
+            }
+        }
+    }
+
+    {
+        ggml_tensor *       ssm_conv = nullptr;
+        const ggml_tensor * res      = nullptr;
+        ggml_tensor *       dst      = nullptr;
+        float               scale    = 0.0f;
+        if (ggml_cuda_match_ssm_conv_res_scale(cgraph, i, ssm_conv, res, dst, scale)) {
+            const int out_idx = i + 3;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &out_idx, 1)) {
+                ggml_cuda_op_ssm_conv_res_scale(*cuda_ctx, ssm_conv, res, dst, scale);
+                return 3;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -5845,8 +6195,62 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
                             add_alloc_deps(i, i + ops.size());
                             i += ops.size() - 1;
+                            continue;
                         }
                     }
+                }
+            }
+
+            {
+                const ggml_tensor * table     = nullptr;
+                const ggml_tensor * sinks     = nullptr;
+                const ggml_tensor * rel_pos   = nullptr;
+                const ggml_tensor * base_mask = nullptr;
+                ggml_tensor *       dst       = nullptr;
+                int                 n_ops     = 0;
+                if (ggml_cuda_match_rel_pos_mask(cgraph, i, table, sinks, rel_pos, base_mask, dst, n_ops)) {
+                    add_alloc_deps(i, i + n_ops - 1);
+                    i += n_ops - 1;
+                    continue;
+                }
+            }
+
+            {
+                const ggml_tensor * src        = nullptr;
+                const ggml_tensor * mul_w      = nullptr;
+                ggml_tensor *       dst        = nullptr;
+                float               eps        = 0.0f;
+                float               post_scale = 0.0f;
+                int                 n_ops      = 0;
+                if (ggml_cuda_match_l2_norm_clip(cgraph, i, src, mul_w, dst, eps, post_scale, n_ops)) {
+                    add_alloc_deps(i, i + n_ops - 1);
+                    i += n_ops - 1;
+                    continue;
+                }
+            }
+
+            {
+                const ggml_tensor * cur        = nullptr;
+                const ggml_tensor * message    = nullptr;
+                const ggml_tensor * gain_raw   = nullptr;
+                const ggml_tensor * forget_raw = nullptr;
+                ggml_tensor *       dst        = nullptr;
+                if (ggml_cuda_match_loop_ctrl(cgraph, i, cur, message, gain_raw, forget_raw, dst)) {
+                    add_alloc_deps(i, i + 5);
+                    i += 5;
+                    continue;
+                }
+            }
+
+            {
+                ggml_tensor *       ssm_conv = nullptr;
+                const ggml_tensor * res      = nullptr;
+                ggml_tensor *       dst      = nullptr;
+                float               scale    = 0.0f;
+                if (ggml_cuda_match_ssm_conv_res_scale(cgraph, i, ssm_conv, res, dst, scale)) {
+                    add_alloc_deps(i, i + 3);
+                    i += 3;
+                    continue;
                 }
             }
         }

@@ -21,3 +21,19 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_l2_norm_fused(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        const ggml_tensor * mul_w,
+        ggml_tensor * dst,
+        float eps,
+        float post_scale);
+
+void ggml_cuda_op_loop_ctrl_fused(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * cur,
+        const ggml_tensor * message,
+        const ggml_tensor * gain_raw,
+        const ggml_tensor * forget_raw,
+        ggml_tensor * dst);
