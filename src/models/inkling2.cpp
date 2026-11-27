@@ -283,7 +283,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     attn = inp->get_attn();
     recr = inp->get_recr();
-    padded_rel_bias.assign(model.n_layer_phys(), nullptr);
+    padded_rel_bias.assign(static_cast<const llama_model_inkling2 &>(model).n_layer_phys(), nullptr);
 
     ggml_tensor * inp_pos = build_inp_pos();
     inp_out_ids = build_inp_out_ids();

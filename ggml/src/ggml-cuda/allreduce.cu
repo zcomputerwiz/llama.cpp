@@ -315,7 +315,7 @@ struct ggml_cuda_ar_pipeline {
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
-    char *                    peer_buf[GGML_CUDA_MAX_DEVICES];   // peer-accessible device staging (chunked kernel)
+    uint8_t *                 peer_buf[GGML_CUDA_MAX_DEVICES];   // peer-accessible device staging (chunked kernel)
     int  *                    peer_arrival[GGML_CUDA_MAX_DEVICES]; // peer-accessible device arrival ring
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
     ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
