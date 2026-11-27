@@ -1480,10 +1480,10 @@ bool llama_context::supports_embd_row() const {
         return false;
     }
 
-    // one of our backends must be able to read the buffer, e.g. not a draft on another GPU than the target output
+    // one of this model's own devices must be able to read the buffer directly
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
-    for (const auto & backend : backends) {
-        if (ggml_backend_supports_buft(backend.get(), buft)) {
+    for (const auto & dev : model.devices) {
+        if (ggml_backend_dev_supports_buft(dev.dev, buft)) {
             return true;
         }
     }

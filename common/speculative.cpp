@@ -3210,6 +3210,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
     if (has_block_draft) {
+        if (result.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            // block drafts (DFlash/DSpark) do not support Meta tensor splitting; keep on one GPU
+            result.split_mode = LLAMA_SPLIT_MODE_NONE;
+        }
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
