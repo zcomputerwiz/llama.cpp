@@ -22,18 +22,6 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-void ggml_cuda_op_l2_norm_fused(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src,
-        const ggml_tensor * mul_w,
-        ggml_tensor * dst,
-        float eps,
-        float post_scale);
-
-void ggml_cuda_op_loop_ctrl_fused(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * cur,
-        const ggml_tensor * message,
-        const ggml_tensor * gain_raw,
-        const ggml_tensor * forget_raw,
-        ggml_tensor * dst);
+// [MUL by w ->] L2_NORM -> SCALE [-> MUL by f], w broadcasts over the rows, f is one value per channel/sample
+void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * l2_norm,
+        const ggml_tensor * scale, const ggml_tensor * f, ggml_tensor * dst);

@@ -54,7 +54,7 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     for (uint32_t il = core_start; il < core_end; ++il) {
         auto & l = loop_layers[il - core_start];
         // the q, k, v and ffn message queries
-        l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, 0);
+        l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, TENSOR_NO_SCALE);
         for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
             l.ctrl_down[c]   = create_tensor(tn(down[c],   "weight", il), {2*n_embd, rank}, 0);
             l.ctrl_gain[c]   = create_tensor(tn(gain[c],   "weight", il), {rank, n_embd}, 0);
@@ -80,8 +80,13 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const int end   = m.core_end;
 
     auto * cur = build_inputs();
-    block_stack blocks;
+    std::vector<ggml_tensor *> blocks;
+
+    // DSpark target features are indexed by layer visit, not by cache slot
+    int visit = 0;
+
     for (int il = 0; il < start; ++il) {
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -89,33 +94,31 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
-        // the bank of the previous pass: its normalized blocks after the first core block, and its normalized output
-        ggml_tensor * bank_states   = nullptr;
-        ggml_tensor * bank_states_t = nullptr;
+        // the bank of the previous pass: its blocks after the first core block, and its output
+        std::vector<ggml_tensor *> bank;
+        ggml_tensor * bank_out = nullptr;
         if (pass > 0) {
-            bank_states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
-            for (size_t b = prelude_blocks.norms.size() + 1; b < blocks.norms.size(); ++b) {
-                bank_states = ggml_concat(ctx0, blocks.norms[b], bank_states, 1);
-            }
-            if (bank_states->ne[1] > 1) {
-                bank_states_t = ggml_cont(ctx0, ggml_transpose(ctx0, bank_states));
-            }
+            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
+            bank_out = cur;
             cur = prelude;
             blocks = prelude_blocks;
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
+            res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix_states(bank_states, bank_states_t, loop.msg_query), &loop);
+            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
         }
     }
 
     for (int il = end; il < m.n_phys; ++il) {
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
+    GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
 }

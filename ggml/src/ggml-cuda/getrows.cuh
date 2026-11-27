@@ -13,11 +13,3 @@ void get_rows_cuda(
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-
-void ggml_cuda_op_rel_pos_mask_fused(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * table,
-        const ggml_tensor * sinks,
-        const ggml_tensor * rel_pos,
-        const ggml_tensor * base_mask,
-        ggml_tensor * dst);
